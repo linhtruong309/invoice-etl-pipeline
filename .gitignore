@@ -1,0 +1,6 @@
+venv/
+TDIC'S Invoices/
+*.db
+*.xlsx
+.vscode/
+.DS_Store
