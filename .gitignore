@@ -4,3 +4,5 @@ TDIC'S Invoices/
 *.xlsx
 .vscode/
 .DS_Store
+__pycache__/
+.pytest_cache/

@@ -9,7 +9,40 @@ from sqlalchemy import create_engine, text
 engine = create_engine('sqlite:///tdic_data.db')
 
 # Locate all target PDF files in working directory
-pdf_files = glob.glob("TDIC's Invoices/*.pdf") or glob.glob("*.pdf")
+BUYER_MST = '0304769887'  # tax code of the buyer (our own company); never a vendor
+
+pdf_files = (
+    glob.glob('inbox/*.pdf')
+    or glob.glob("TDIC's Invoices/*.pdf")
+    or glob.glob('*.pdf')
+)
+if not pdf_files:
+  raise SystemExit('No PDF files found (looked in inbox/ and the current folder)')
+
+
+def find_col(header_row, include, prefer=(), exclude=()):
+  """Index of the header cell matching `include`, or -1.
+
+  Cells that also match `prefer` win; otherwise the first cell that matches
+  none of `exclude`. (The old loop let the LAST matching column win, so
+  'Thành tiền có thuế' beat 'Thành tiền chưa có thuế', and the bare keyword
+  'amount' matched the 'VAT Amount' column.)
+  """
+  matches = [
+      i for i, t in enumerate(header_row) if any(k in t for k in include)
+  ]
+  for i in matches:
+    if any(k in header_row[i] for k in prefer):
+      return i
+  for i in matches:
+    if not any(k in header_row[i] for k in exclude):
+      return i
+  return -1
+
+
+def squeeze_digits(text):
+  """'0 1 0 0 7 3 6 3 4 7' -> '0100736347' (some PDFs space out the tax code)."""
+  return re.sub(r'(?:\d ){9}\d', lambda m: m.group(0).replace(' ', ''), text)
 
 all_invoices = []
 all_details = []
@@ -31,7 +64,7 @@ for pdf_path in pdf_files:
   # 1. Invoice Number Extraction
   file_num = re.search(r'(\d+)', file_name)
   if file_num:
-    invoice_no = file_num.group(1).zfill(7)
+    invoice_no = file_num.group(1).zfill(8)
 
   try:
     with pdfplumber.open(pdf_path) as pdf:
@@ -48,7 +81,7 @@ for pdf_path in pdf_files:
             re.IGNORECASE,
         )
         if inv_match:
-          invoice_no = inv_match.group(1).zfill(7)
+          invoice_no = inv_match.group(1).zfill(8)
         else:
           invoice_no = file_name.split('.')[0]
 
@@ -80,12 +113,14 @@ for pdf_path in pdf_files:
                 b_kw in line_lower
                 for b_kw in ['người mua', 'đơn vị mua', 'khách hàng']
             ):
-              mst_m = re.search(r'\b\d{10}(?:-\d{3})?\b', line)
-              if mst_m:
+              mst_m = re.search(r'\b\d{10}(?:-\d{3})?\b', squeeze_digits(line))
+              if mst_m and mst_m.group(0) != BUYER_MST:
                 vendor_mst = mst_m.group(0)
-              elif idx + 1 < len(p1_lines):
-                next_m = re.search(r'\b\d{10}(?:-\d{3})?\b', p1_lines[idx + 1])
-                if next_m:
+              elif not mst_m and idx + 1 < len(p1_lines):
+                next_m = re.search(
+                    r'\b\d{10}(?:-\d{3})?\b', squeeze_digits(p1_lines[idx + 1])
+                )
+                if next_m and next_m.group(0) != BUYER_MST:
                   vendor_mst = next_m.group(0)
 
         # Vendor Name
@@ -169,6 +204,15 @@ for pdf_path in pdf_files:
             except:
               pass
 
+        # Summary row with three amounts: pre-tax, VAT, total payable
+        if line_lower.startswith('tổng cộng') and 'thanh toán' not in line_lower:
+          amounts = [
+              int(n.replace('.', ''))
+              for n in re.findall(r'\d{1,3}(?:\.\d{3})+', line)
+          ]
+          if len(amounts) == 3:
+            pre_tax_total, tax_amount, grand_total = amounts
+
       if tax_rate is None or tax_rate == 0.0:
         if pre_tax_total > 0 and tax_amount > 0:
           tax_rate = round(tax_amount / pre_tax_total, 2)
@@ -188,25 +232,16 @@ for pdf_path in pdf_files:
                 for cell in table[0]
             ]
 
-            qty_idx = -1
-            price_idx = -1
-            total_idx = -1
-
-            for idx, col_text in enumerate(header_row):
-              if any(
-                  k in col_text for k in ['số lượng', 'sl', 'quantity', 'qty']
-              ):
-                qty_idx = idx
-              elif any(
-                  k in col_text
-                  for k in ['đơn giá', 'giá', 'price', 'unit price']
-              ):
-                price_idx = idx
-              elif any(
-                  k in col_text
-                  for k in ['thành tiền', 'tổng tiền', 'amount', 'total']
-              ):
-                total_idx = idx
+            qty_idx = find_col(header_row, ['số lượng', 'quantity', 'qty'])
+            price_idx = find_col(header_row, ['đơn giá', 'unit price'])
+            total_idx = find_col(
+                header_row,
+                ['thành tiền', 'tổng tiền', 'amount'],
+                prefer=['chưa có thuế', 'chưa thuế', 'trước thuế'],
+                exclude=['có thuế', 'sau thuế', 'tiền thuế', 'vat amount'],
+            )
+            rate_idx = find_col(header_row, ['thuế suất'])
+            unit_idx = find_col(header_row, ['đơn vị', 'đvt'])
 
             for row in table[1:]:
               if not row:
@@ -283,18 +318,35 @@ for pdf_path in pdf_files:
                 if qty == 0:
                   continue
 
-                line_tax_amount = int(round(line_total * tax_rate))
+                row_rate = tax_rate
+                if rate_idx != -1 and rate_idx < len(clean_row):
+                  m_rate = re.search(
+                      r'(\d+(?:[.,]\d+)?)\s*%', clean_row[rate_idx]
+                  )
+                  if m_rate:
+                    row_rate = round(
+                        float(m_rate.group(1).replace(',', '.')) / 100.0, 4
+                    )
+                unit_val = 'Cái'
+                if (
+                    unit_idx != -1
+                    and unit_idx < len(clean_row)
+                    and clean_row[unit_idx]
+                ):
+                  unit_val = clean_row[unit_idx]
+
+                line_tax_amount = int(round(line_total * row_rate))
                 line_grand_total = int(round(line_total + line_tax_amount))
 
                 items_list.append({
                     'Invoice_No': invoice_no,
                     'Item_STT': stt_val,
                     'Item_Name': item_name,
-                    'Unit': 'Cái',
+                    'Unit': unit_val,
                     'Quantity': qty,
                     'Unit_Price': unit_price,
                     'Line_Total': line_total,
-                    'Tax_Rate': tax_rate,
+                    'Tax_Rate': row_rate,
                     'Tax_Amount': line_tax_amount,
                     'Grand_Total': line_grand_total,
                 })
@@ -365,6 +417,7 @@ for pdf_path in pdf_files:
           'CÔNG TY CỔ PHẦN ĐẦU TƯ XÂY DỰNG SẢN XUẤT THƯƠNG MẠI TẤN DŨNG'
       )
 
+    totals_from_pdf = pre_tax_total > 0 and grand_total > 0
     if pre_tax_total == 0 and items_list:
       pre_tax_total = int(
           round(sum(item['Line_Total'] for item in items_list))
@@ -375,6 +428,15 @@ for pdf_path in pdf_files:
 
     if grand_total == 0 and pre_tax_total > 0:
       grand_total = int(round(pre_tax_total + tax_amount))
+
+    if not totals_from_pdf:
+      print(f'  [warn] {invoice_no}: totals not found in PDF, derived from lines')
+    if (
+        pre_tax_total > 0
+        and tax_amount > 0
+        and abs(pre_tax_total * tax_rate - tax_amount) > 1
+    ):
+      tax_rate = round(tax_amount / pre_tax_total, 4)  # mixed-rate invoice
 
     all_invoices.append({
         'Invoice_No': invoice_no,
@@ -415,6 +477,7 @@ if all_invoices:
   if not df_details.empty:
     df_details = df_details.drop_duplicates(subset=['Invoice_No', 'Item_STT'])
     df_details = df_details.sort_values(by=['Invoice_No', 'Item_STT'])
+    df_details['Unit'] = df_details['Unit'].str.strip().str.lower()
 
   with engine.connect() as conn:
     conn.execute(text('DROP TABLE IF EXISTS invoices;'))
