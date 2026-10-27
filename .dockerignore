@@ -1,0 +1,12 @@
+venv/
+.venv/
+.git/
+__pycache__/
+.pytest_cache/
+.vscode/
+inbox/
+TDIC'S Invoices/
+staging/
+*.db
+*.xlsx
+draft_parse_pdf.py

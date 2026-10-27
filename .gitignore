@@ -6,3 +6,5 @@ TDIC'S Invoices/
 .DS_Store
 __pycache__/
 .pytest_cache/
+inbox/
+staging/

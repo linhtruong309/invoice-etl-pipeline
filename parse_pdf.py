@@ -1,23 +1,45 @@
+"""Extract, transform and load PDF invoices into SQLite.
+
+Stages (each usable on its own, e.g. as an Airflow task):
+    find_pdf_files() -> extract(pdf_files) -> transform(...) -> load(...)
+Run the whole thing with:  python parse_pdf.py
+"""
 import glob
 import os
 import re
+
 import pandas as pd
 import pdfplumber
 from sqlalchemy import create_engine, text
 
-# Initialize Database Connection
-engine = create_engine('sqlite:///tdic_data.db')
-
-# Locate all target PDF files in working directory
+DB_URL = 'sqlite:///tdic_data.db'
 BUYER_MST = '0304769887'  # tax code of the buyer (our own company); never a vendor
 
-pdf_files = (
-    glob.glob('inbox/*.pdf')
-    or glob.glob("TDIC's Invoices/*.pdf")
-    or glob.glob('*.pdf')
-)
-if not pdf_files:
-  raise SystemExit('No PDF files found (looked in inbox/ and the current folder)')
+INVOICE_COLUMNS = [
+    'Invoice_No',
+    'Vendor_Name',
+    'Vendor_MST',
+    'Buyer_Name',
+    'Pre_Tax_Total',
+    'Tax_Rate',
+    'Tax_Amount',
+    'Grand_Total',
+    'File_Name',
+]
+
+
+def find_pdf_files():
+  """PDF files to process: inbox/ first, then the legacy folder, then the cwd."""
+  pdf_files = (
+      glob.glob('inbox/*.pdf')
+      or glob.glob("TDIC's Invoices/*.pdf")
+      or glob.glob('*.pdf')
+  )
+  if not pdf_files:
+    raise FileNotFoundError(
+        'No PDF files found (looked in inbox/ and the current folder)'
+    )
+  return sorted(pdf_files)
 
 
 def find_col(header_row, include, prefer=(), exclude=()):
@@ -44,10 +66,9 @@ def squeeze_digits(text):
   """'0 1 0 0 7 3 6 3 4 7' -> '0100736347' (some PDFs space out the tax code)."""
   return re.sub(r'(?:\d ){9}\d', lambda m: m.group(0).replace(' ', ''), text)
 
-all_invoices = []
-all_details = []
 
-for pdf_path in pdf_files:
+def parse_invoice(pdf_path):
+  """Parse one PDF. Returns (invoice_dict, line_item_dicts), or (None, []) on error."""
   file_name = os.path.basename(pdf_path)
   print(f"Processing file: {pdf_path}...")
 
@@ -438,7 +459,7 @@ for pdf_path in pdf_files:
     ):
       tax_rate = round(tax_amount / pre_tax_total, 4)  # mixed-rate invoice
 
-    all_invoices.append({
+    invoice = {
         'Invoice_No': invoice_no,
         'Vendor_Name': vendor_name if vendor_name else 'Pending',
         'Vendor_MST': vendor_mst if vendor_mst else 'N/A',
@@ -448,37 +469,42 @@ for pdf_path in pdf_files:
         'Tax_Amount': int(tax_amount),
         'Grand_Total': int(grand_total),
         'File_Name': pdf_path,
-    })
-
-    all_details.extend(items_list)
+    }
+    return invoice, items_list
 
   except Exception as e:
     print(f'Error processing file {pdf_path}: {e}')
+    return None, []
 
-# 5. Database Writing
-if all_invoices:
+
+def extract(pdf_files):
+  """Parse every PDF. Returns (invoices, line_items) as lists of dicts."""
+  all_invoices, all_details = [], []
+  for pdf_path in pdf_files:
+    invoice, items = parse_invoice(pdf_path)
+    if invoice is not None:
+      all_invoices.append(invoice)
+      all_details.extend(items)
+  return all_invoices, all_details
+
+
+def transform(all_invoices, all_details):
+  """Deduplicate, order and normalise into two DataFrames."""
   df_invoices = pd.DataFrame(all_invoices)
   df_invoices = df_invoices.drop_duplicates(subset=['Invoice_No'])
-
-  desired_order = [
-      'Invoice_No',
-      'Vendor_Name',
-      'Vendor_MST',
-      'Buyer_Name',
-      'Pre_Tax_Total',
-      'Tax_Rate',
-      'Tax_Amount',
-      'Grand_Total',
-      'File_Name',
-  ]
-  df_invoices = df_invoices[desired_order]
+  df_invoices = df_invoices[INVOICE_COLUMNS]
 
   df_details = pd.DataFrame(all_details)
   if not df_details.empty:
     df_details = df_details.drop_duplicates(subset=['Invoice_No', 'Item_STT'])
     df_details = df_details.sort_values(by=['Invoice_No', 'Item_STT'])
     df_details['Unit'] = df_details['Unit'].str.strip().str.lower()
+  return df_invoices, df_details
 
+
+def load(df_invoices, df_details, db_url=DB_URL):
+  """Rebuild both tables from scratch, so re-running never duplicates rows."""
+  engine = create_engine(db_url)
   with engine.connect() as conn:
     conn.execute(text('DROP TABLE IF EXISTS invoices;'))
     conn.execute(text('DROP TABLE IF EXISTS invoice_details;'))
@@ -490,6 +516,24 @@ if all_invoices:
         'invoice_details', con=engine, if_exists='replace', index=False
     )
 
+
+def run(db_url=DB_URL):
+  pdf_files = find_pdf_files()
+  all_invoices, all_details = extract(pdf_files)
+  if not all_invoices:
+    print('No invoices were parsed; database left unchanged.')
+    return
+
+  df_invoices, df_details = transform(all_invoices, all_details)
+  load(df_invoices, df_details, db_url)
+
   print('\n=== PARSING COMPLETED ===')
   print(f'Total Invoices Processed: {len(df_invoices)}')
   print(f'Total Detailed Line Items Extracted: {len(df_details)}')
+
+
+if __name__ == '__main__':
+  try:
+    run()
+  except FileNotFoundError as e:
+    raise SystemExit(str(e))
