@@ -8,3 +8,5 @@ __pycache__/
 .pytest_cache/
 inbox/
 staging/
+airflow-home/
+*.log
